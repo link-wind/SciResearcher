@@ -22,30 +22,61 @@ def create_task(file_url: str, file_path: str = None) -> str:
     创建MinerU解析任务
     支持URL和本地文件上传
     """
-    url = 'https://mineru.net/api/v4/extract/task'
     token = os.getenv("MINERU_API_TOKEN")
-    header = {
-        'Authorization': f'Bearer {token}'
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}"
     }
 
-    # 如果提供了本地文件路径，则上传文件
+    # 如果提供了本地文件路径，则使用临时URL上传方式
     if file_path and os.path.exists(file_path):
-        print(f"📤 Uploading local file: {file_path}")
-        with open(file_path, 'rb') as f:
-            files = {
-                'file': (os.path.basename(file_path), f, 'application/pdf')
-            }
-            data = {
-                'is_ocr': 'true',
-                'enable_formula': 'true',
-                'enable_table': 'true',
-                'language': 'ch',
-                'model_version': 'v2'
-            }
-            res = requests.post(url, headers=header, files=files, data=data, timeout=60)
+        pdf_filename = os.path.basename(file_path)
+        print(f"📤 正在申请临时上传URL: {pdf_filename}")
+
+        # 1. 申请批量上传URL
+        apply_url = "https://mineru.net/api/v4/file-urls/batch"
+        request_data = {
+            "files": [{"name": pdf_filename}],
+            "model_version": "vlm"
+        }
+
+        try:
+            apply_res = requests.post(apply_url, headers=headers, json=request_data)
+            apply_res.raise_for_status()
+            apply_data = apply_res.json()
+
+            if apply_data["code"] != 0:
+                raise RuntimeError(f"申请上传URL失败: {apply_data['msg']}")
+
+            batch_id = apply_data["data"]["batch_id"]
+            upload_url = apply_data["data"]["file_urls"][0]
+            print(f"✅ 申请临时上传URL成功，batch_id: {batch_id}")
+        except Exception as e:
+            raise RuntimeError(f"申请上传URL异常: {str(e)}")
+
+        # 2. PUT方式上传文件到OSS（核心：绕过网关payload限制）
+        try:
+            print(f"📤 正在通过PUT方式上传文件...")
+            with open(file_path, "rb") as f:
+                upload_res = requests.put(upload_url, data=f)
+
+            if upload_res.status_code not in (200, 201):
+                raise RuntimeError(f"文件上传失败：状态码{upload_res.status_code}")
+
+            print(f"✅ PDF文件上传成功（PUT方式）")
+        except Exception as e:
+            raise RuntimeError(f"文件上传异常: {str(e)}")
+
+        # 3. 返回batch_id作为task_id
+        return batch_id
+
+    # 如果使用的是URL，则使用原来的URL解析方式
     else:
-        # 使用URL
-        header['Content-Type'] = 'application/json'
+        url = 'https://mineru.net/api/v4/extract/task'
+        header = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {token}'
+        }
         data = {
             'url': file_url,
             'is_ocr': True,
@@ -54,25 +85,27 @@ def create_task(file_url: str, file_path: str = None) -> str:
             'language': "ch",
             'model_version': "v2"
         }
-        res = requests.post(url, headers=header, json=data, timeout=10)
+        res = requests.post(url, headers=header, json=data, timeout=30)
 
-    res.raise_for_status()
-    res_data = res.json()
+        res.raise_for_status()
+        res_data = res.json()
 
-    if res_data["code"] != 0:
-        raise RuntimeError(f"任务提交失败: {res_data['msg']}")
+        if res_data["code"] != 0:
+            raise RuntimeError(f"任务提交失败: {res_data['msg']}")
 
-    task_id_data = res_data["data"]["task_id"]
-    return task_id_data
+        task_id_data = res_data["data"]["task_id"]
+        return task_id_data
 
 
-def query_by_id(task_id: str, max_retries: int = 100, retry_interval: int = 5) -> str:
+def query_by_id(task_id: str, max_retries: int = 60, retry_interval: int = 10) -> str:
     """
-    查询任务状态并返回zip_url
+    优化后的轮询查询解析结果（先判断状态，再处理full_zip_url）
+    支持批量结果查询和详细状态反馈
     """
-    url = f'https://mineru.net/api/v4/extract/task/{task_id}'
+    # 使用批量结果查询端点
+    url = f'https://mineru.net/api/v4/extract-results/batch/{task_id}'
     token = os.getenv("MINERU_API_TOKEN")
-    header = {
+    headers = {
         'Content-Type': 'application/json',
         'Authorization': f'Bearer {token}'
     }
@@ -80,40 +113,85 @@ def query_by_id(task_id: str, max_retries: int = 100, retry_interval: int = 5) -
     retries = 0
     while retries < max_retries:
         try:
-            res = requests.get(url, headers=header, timeout=10)
-            res.raise_for_status()
+            res = requests.get(url, headers=headers, timeout=30)
+            res.raise_for_status()  # 捕获HTTP请求错误
             data = res.json()
 
-            if "data" in data and "full_zip_url" in data["data"] and data["data"]["full_zip_url"]:
-                return data["data"]["full_zip_url"]
-            else:
-                print(f"full_zip_url 为空，正在等待任务完成。已重试 {retries + 1} 次，共 {max_retries} 次。")
+            if data["code"] != 0:
+                print(f"❌ 查询解析状态失败：{data['msg']}")
+                break
+
+            # 核心：先获取任务状态，再判断是否读取full_zip_url
+            extract_result = data["data"]["extract_result"]
+            if not extract_result:
+                print(f"❌ 第{retries+1}次查询：extract_result为空")
                 time.sleep(retry_interval)
                 retries += 1
-        except requests.exceptions.RequestException as e:
-            print(f"请求失败，错误信息：{e}。正在重试...")
+                continue
+
+            task_info = extract_result[0]
+            task_state = task_info["state"]
+            task_err_msg = task_info.get("err_msg", "")
+
+            # 状态分类处理
+            if task_state == "done":
+                # 任务完成，检查full_zip_url是否有效
+                full_zip_url = task_info.get("full_zip_url", "")
+                if full_zip_url:
+                    print(f"✅ 任务完成！获取到结果URL")
+                    return full_zip_url
+                else:
+                    print(f"⚠️ 任务状态为done，但full_zip_url为空，重试第{retries+1}次...")
+
+            elif task_state == "failed":
+                print(f"❌ 解析任务失败：{task_err_msg}")
+                raise Exception(f"解析任务失败：{task_err_msg}")
+
+            else:
+                # 任务处理中（pending/running/converting）
+                print(f"⏳ 解析中（状态：{task_state}），full_zip_url暂未生成，等待{retry_interval}秒... 已重试{retries+1}次")
+
+            # 未完成则等待重试
             time.sleep(retry_interval)
             retries += 1
 
-    raise Exception(f"在 {max_retries} 次重试后，仍未获取到有效的 full_zip_url。")
+        except requests.exceptions.RequestException as e:
+            print(f"❌ 查询解析结果异常：{str(e)}，重试第{retries+1}次...")
+            time.sleep(retry_interval)
+            retries += 1
+
+    # 最终结果判断
+    raise Exception(f"解析超时（超过{max_retries*retry_interval/60}分钟），请检查任务状态或联系MinerU官方")
 
 
 def download_and_extract_zip(zip_url: str) -> Dict[str, any]:
     """
     下载并提取ZIP文件内容
+    优先使用full.md作为最终解析文件
     """
     print(f"📥 Downloading: {zip_url[:60]}...")
-    res = requests.get(zip_url, timeout=60)
+    res = requests.get(zip_url, timeout=300)
     res.raise_for_status()
 
     result = {"markdown": "", "content_list": [], "tables": [], "images": []}
 
     with zipfile.ZipFile(io.BytesIO(res.content)) as zf:
-        # Markdown
-        try:
-            result["markdown"] = zf.read("output.md").decode("utf-8")
-        except KeyError:
-            pass
+        # 核心：优先查找full.md（MinerU默认的完整解析结果文件）
+        md_file_found = False
+        for md_filename in ["full.md", "output.md", "parsed.md", "document.md"]:
+            try:
+                markdown_content = zf.read(md_filename).decode("utf-8")
+                result["markdown"] = markdown_content
+                print(f"✅ 成功读取解析文件: {md_filename}")
+                md_file_found = True
+                break
+            except KeyError:
+                continue
+
+        if not md_file_found:
+            print("⚠️ 未找到标准MD文件，列出压缩包内容以便排查:")
+            for name in zf.namelist():
+                print(f"  - {name}")
 
         # Content List
         try:
@@ -138,7 +216,14 @@ def download_and_extract_zip(zip_url: str) -> Dict[str, any]:
         except Exception:
             pass
 
-    print(f"✓ Downloaded and extracted successfully")
+    # 验证markdown内容是否完整
+    if result["markdown"]:
+        markdown_preview = result["markdown"][:300]
+        print(f"\n📝 解析内容预览:\n{markdown_preview}...")
+        print(f"✅ 完整解析结果提取完成 (总长度: {len(result['markdown'])} 字符)")
+    else:
+        print("⚠️ 警告: 未能提取到Markdown内容")
+
     return result
 
 
