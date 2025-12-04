@@ -1,12 +1,10 @@
 """
 向量数据库模块
-使用ChromaDB + 魔搭Embedding API
+使用ChromaDB + 本地嵌入模型
 """
-import os
 import json
 from pathlib import Path
 from typing import List, Dict, Optional
-from openai import OpenAI
 import uuid
 
 
@@ -29,10 +27,6 @@ class VectorDB:
         self.collection = self.client.get_or_create_collection(
             name=collection_name,
             metadata={"hnsw:space": "cosine"}
-        )
-        self.openai_client = OpenAI(
-            api_key=os.getenv("MODELSCOPE_API_KEY"),
-            base_url=os.getenv("MODELSCOPE_BASE_URL")
         )
 
     def embed_text(self, text: str) -> List[float]:
@@ -132,7 +126,7 @@ class VectorDB:
 
             # 格式化结果
             formatted_results = []
-            for i, (doc, metadata, distance) in enumerate(zip(
+            for _, (doc, metadata, distance) in enumerate(zip(
                 results['documents'][0],
                 results['metadatas'][0],
                 results['distances'][0]
